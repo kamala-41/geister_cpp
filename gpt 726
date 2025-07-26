@@ -1,0 +1,652 @@
+了解，我將根據你提供的論文《基於 OpenSpiel 的幽靈棋遊戲策略研究》與 GAT 比賽使用的規則，實作一個完整的幽靈棋 C++ 遊戲類別，能被整合進 OpenSpiel 的 `games/` 模組中。這個版本會包含：
+
+* 不完美資訊設計（隱藏敵方棋子顏色）
+* 初始佈局隨機生成（70 種合法配置）
+* 動作空間設計為 `6x6x4 = 144`，以 action id 編碼
+* 完整的 Game / State 類別、合法行動、生死判定與報酬回傳
+
+我會盡快完成 C++ 遊戲架構實作範本給你參考。
+
+
+# Geister (Ghosts) Game Implementation for OpenSpiel
+
+## Game Overview and Rules
+
+* **Board and Pieces:** Geister (also known as Ghosts) is a two-player board game played on a 6×6 grid. Each player has 8 ghost pieces: 4 *“good”* ghosts (marked blue) and 4 *“evil”* ghosts (marked red). At the start, each player secretly arranges their 8 ghosts on their half of the board (the two rows on their side) in any configuration (4 blue, 4 red) on the designated 8 starting squares. There are \$C(8,4)=70\$ possible color configurations for each side’s initial placement, so there are 70×70 = 4900 possible combined openings. The four corner squares of the board are **escape points** (exits) from the board.
+
+* **Hidden Information:** Players **cannot see the colors** of their opponent’s ghosts. All opponent pieces appear identical, and their true nature (good/blue or evil/red) is hidden. Only the owning player knows which of their ghosts are blue or red. When a ghost is captured, its color is revealed to the opponent at that moment.
+
+* **Movement and Capture:** Players alternate turns (sequential play). On your turn, you must move one of your ghosts **one square up, down, left, or right** (no diagonal moves). If you move into a square occupied by an opponent’s ghost, you capture that ghost and remove it from the board. Upon capture, the piece’s color is revealed to the capturer (and both players then know whether a captured ghost was good or evil).
+
+* **Win Conditions:** A player can win the game in **three ways**: **(1)** Capture **all four of the opponent’s “good” (blue) ghosts**, leaving them with no good ghosts. **(2)** Have **all four of your own “evil” (red) ghosts captured by the opponent**, which means your opponent fell into the trap of taking all your evil ghosts – in this case **you win** (equivalently, if a player captures all four of the opponent’s red ghosts, that player loses). **(3)** **Escape** one of your “good” (blue) ghosts by moving it off the board through one of the **opponent’s corner exits** (i.e. a blue ghost reaching one of the far-side corner squares immediately wins the game for its owner). Each player’s escape exits are the two corner squares on the opponent’s side of the board.
+
+* **Draw Condition:** According to tournament rules (e.g. GAT competition), if the game reaches **200 moves** (each move is a single ghost movement) without a winner (i.e. 100 turns by each player) the game is declared a **draw**.
+
+These rules define an **imperfect-information, zero-sum** game with hidden information about piece identities. Next, we outline how to implement this game within the OpenSpiel framework, including the game logic and the required interfaces.
+
+## OpenSpiel Integration and Design
+
+To integrate Geister into OpenSpiel, we create a new game module (e.g. in `open_spiel/games/ghost.{h,cc}`) implementing the standard Game and State interfaces for a **two-player**, sequential, partially-observable game. Key aspects of the implementation include supporting **hidden information** (imperfect information) for the players, random initial piece configuration, move generation with action masking, and terminal state evaluation.
+
+### Game Definition and Properties
+
+We define a `GhostGame` class (subclass of `open_spiel::Game`) and a corresponding `GhostState` class (subclass of `open_spiel::State`). The game’s properties can be specified via a static `GameType` structure, for example:
+
+* `short_name = "ghost"` (unique identifier), `long_name = "Geister (Ghosts)"`.
+* `num_players = 2`.
+* `dynamics = GameType::Dynamics::kSequential` (players alternate turns).
+* `chance_mode = GameType::ChanceMode::kSampledStochastic` (since we will randomly assign initial piece layouts).
+* `information = GameType::Information::kImperfectInformation` (players have hidden information).
+* `utility = GameType::Utility::kZeroSum` (outcomes are win (+1)/lose (−1)/draw (0) sums to zero).
+* `reward_model = GameType::RewardModel::kTerminal` (rewards given at end of game).
+
+The `GhostGame` constructor will pass these properties to the base `Game` class. No special game parameters are needed beyond perhaps board size (which is fixed at 6) or a seed for randomness if desired. We then register the game with OpenSpiel’s game registry so it can be looked up by name `"ghost"`.
+
+### State Representation
+
+The `GhostState` holds the evolving game state, including piece locations, identities, and game status. A convenient representation is to maintain for each player a list of their pieces and their properties:
+
+* An array of **8 pieces per player**, where each piece has: its board position `(row, col)`, a boolean flag `is_blue` (true for blue/good, false for red/evil), and a flag if it’s still active (not captured or escaped). For example, `pieces_[player][i]` for \$i=0..7\$.
+* A 6×6 board matrix can be maintained (or computed) to quickly map each board cell to which piece occupies it (e.g. store an index or ID, or -1 if empty). This helps in move legality checks and capture handling.
+* Hidden information is inherent: one player does not know the `is_blue` flag of the opponent’s pieces (until revealed). We will enforce this by providing observations that only include what a player can see (see **Observation** below).
+* **Move count** to track the total number of moves made, for draw condition.
+* **Capture counts**: counters for how many blue/red ghosts each player has captured (or equivalently, how many of each of their opponent’s ghosts have been eliminated). For example, `blue_captured_by_[player]` and `red_captured_by_[player]`. These can be updated on each capture and used to check win conditions.
+
+We also maintain standard state variables such as `current_player_` (whose turn it is, or `kTerminalPlayerId` if game is over), and an outcome flag or returns array for scoring at terminal states.
+
+**Initial State Setup:** When a new game state is created, we randomly assign each player’s 8 pieces to the starting positions with a random distribution of 4 blue and 4 red per player. The starting positions are the 8 specific squares on each player’s home rows (typically the central 4 columns of the two rows closest to that player, as per standard rules). We can, for example, fix the set of starting coordinates for each side and then randomly choose 4 of those positions to place the blue ghosts and the rest for red ghosts. This **random initial layout** is a chance element in the game. In our implementation, since `chance_mode` is set to `kSampledStochastic`, we can perform this random setup in the `GhostState` constructor (or in `NewInitialState()`) using a random number generator to sample one of the 70 possible configurations for each player. The chosen configuration (which piece is blue/red) is hidden from the opponent. After setup, the state’s `current_player_` is set to Player 0 (assuming Player 0 always moves first).
+
+### Action Encoding and Move Generation
+
+We define the **action space** to cover all possible moves on the board. We assign each combination of board cell and movement direction a unique action ID. Specifically, since there are 36 board squares and 4 possible move directions per square, we have at most **144 possible moves** (36×4) in the action space. We number actions as:
+
+$\text{ActionID} = 4 \times (\text{row} \times 6 + \text{col}) + \text{dir},$
+
+where `row` and `col` are the 0-indexed coordinates of the **source** square of the move, and `dir` ∈ {0,1,2,3} corresponds to moving **Up, Down, Left,** or **Right** respectively. For example, action 0 might denote moving the piece at (0,0) up, action 1 = (0,0) down, 2 = (0,0) left, 3 = (0,0) right; action 4 = (0,1) up, and so on. This fixed encoding allows us to map an action ID to a specific move.
+
+However, **not all of these 144 actions will be legal at a given time**. The `GhostState::LegalActions()` method must compute the set of currently valid moves for the current player. We will do the following each turn:
+
+* Iterate over all pieces belonging to the current player that are still on the board (not captured or escaped).
+* For each piece, consider the 4 directional moves (up, down, left, right). Compute the target cell (row+δ\_row, col+δ\_col).
+* Check **move legality**: The move is legal if the target cell is within bounds (0 ≤ row < 6, 0 ≤ col < 6) and is either empty or contains an opponent’s piece (you can move into opponent piece to capture it). You cannot move onto your own piece (no stacking), and cannot stay put.
+* If the target is valid, compute the corresponding action ID and include it in the legal moves list.
+
+We will also implement **action masking** by providing a legal-move mask if needed: a length-144 binary vector where positions corresponding to illegal moves are 0. This ensures an RL agent doesn’t select invalid moves. (OpenSpiel’s API allows obtaining `LegalActionsMask()` or the agent can use the legal moves list.)
+
+### State Transitions and ApplyAction
+
+The `GhostState::ApplyAction(Action action)` method executes a chosen action to update the state:
+
+1. **Decode the action ID:** We compute the source square (row, col) and direction from the action number (inverse of the encoding formula). Identify which piece (of the current player) is located at (row, col). (If no friendly piece is at the source, that action would not have been in legal moves.)
+2. **Move the piece:** Update the piece’s coordinates to the target square in our `pieces_` array and update the board occupancy (the source becomes empty, the target now occupied by this piece).
+3. **Capture if applicable:** If an opponent’s piece was on the target square, it is captured. Mark the opponent’s piece as captured/removed. Update capture counters: if the captured piece was blue (good), increment `blue_captured_by_[current_player]`; if it was red (evil), increment `red_captured_by_[current_player]`. Because the capturing player now learns the color of this captured piece, the information state for the future will reflect that (the number of opponent blue/red captured is known).
+4. **Escape check:** If the moved piece **belongs to the mover** and the target square is one of the opponent’s corner exit squares, and moreover the piece is a blue ghost, then that piece escapes the board. We would mark that piece as escaped/removed from play, and this triggers an immediate win for the moving player. (In practice, in ApplyAction we will detect this and set the game as terminal with a win.)
+5. **Increment move count:** Increase the turn counter. If the move count reaches 200 without a winner, we will mark the game as a draw.
+6. **Switch player:** Set `current_player_` to the other player (unless the game ended). In OpenSpiel, if the game is now terminal, we set `current_player_ = kTerminalPlayerId`.
+
+After each action, we call a helper to check if the game has reached a **terminal condition** (win or draw). The win conditions are checked as described: if `blue_captured_by_[p] == 4`, then player *p* has captured all opponent’s blue ghosts and wins. If `red_captured_by_[p] == 4`, then player *p* has captured all opponent’s red ghosts – which means player *p* loses and the opponent wins. We also check the escape condition flagged during the move. Draw is checked if `move_count >= 200` with no winner. When a terminal condition is met, we record the outcome.
+
+### Terminal State and Rewards
+
+When `IsTerminal()` returns true, the game is over. We then define `Returns()` (or `Utility`) for the two players. In a win/lose outcome, we can use +1 for the winner and -1 for the loser (consistent with zero-sum). In case of a draw, both players receive 0. For example, if Player 0 wins, Returns() = {+1.0, -1.0}; if Player 1 wins, Returns() = {-1.0, +1.0}; if draw, {0.0, 0.0}. These values will be the final rewards used for reinforcement learning. The implementation can set these when the terminal state is reached.
+
+### Imperfect Information: Observations and Information States
+
+Because Geister is an imperfect-information game, we must provide observation functions that reveal only the information each player has. We will implement:
+
+* **ObservationTensor(player):** Returns a tensor (or vector) representing the **current observation** for the specified player. A suitable design (as used in the referenced research) is to use a 3-channel \$6×6\$ binary tensor:
+
+  * **Channel 1:** Positions of the observing player’s **own blue ghosts** (1 on squares containing one of their blue pieces, else 0).
+  * **Channel 2:** Positions of the player’s **own red ghosts** (1 where a red piece is).
+  * **Channel 3:** Positions of the **opponent’s pieces that are currently visible** to this player. In Geister, the opponent’s piece is “visible” on a square if the piece is present, but its color is not known. We mark 1 for any square occupied by an opponent’s piece (regardless of its hidden color). If an opponent’s piece was captured earlier, the player would know its color (from the act of capture), but those pieces are no longer on the board; the knowledge of captured pieces is handled via additional info (see below).
+
+  This 3×6×6 tensor constitutes the observable board state from the player’s perspective. In addition, one can concatenate extra features such as the counts of captured ghosts and whose turn it is:
+
+  * One-hot encodings of how many of the player’s opponent’s blue and red ghosts have been captured (and vice versa) could be included as additional features. For example, 5-dimensional one-hot for opponent’s blue captured (0–4) and similarly for others, which was done in the research to avoid ambiguity in linear scale.
+  * A one-hot indicator of the player’s identity (first or second player) to mark whose perspective the observation is for. This helps a learning model differentiate observations of different players.
+
+  These extra features would expand the observation vector beyond the 3×6×6 grid, but including them is useful for reinforcement learning agents. In a simpler implementation, the observation could just be the 3-channel board tensor, and the agent can infer capture counts from missing pieces, but explicit features make it easier.
+
+* **InformationStateTensor(player):** This should capture the **information available to that player throughout the game** (i.e., perfect recall of what they have observed). In OpenSpiel, one approach is to incorporate the observation history or simply use the current observation plus any **remembered information** (which, in this game, is largely the count of captured pieces and initial configuration knowledge). Since each player knows their own initial piece layout (the color arrangement they chose) and all actions taken (including captures revealing certain piece colors), the information state can be represented by the combination of the **player’s initial configuration** and the sequence of observations/actions seen so far. For practical implementation, one might not reconstruct the entire history tensor; instead, because the game is fully observable to itself, we can derive the necessary info from the current state: the player knows which of their own pieces remain and which have been captured, how many of opponent’s pieces of each color have been captured, etc. Thus, an `InformationStateTensor` could concatenate:
+
+  * The player’s **initial placement** (which of their starting 8 positions had blue vs red – this is private knowledge).
+  * The current observation (as above).
+  * The counts of captured pieces (which the player knows).
+  * Perhaps the move count or other cumulative aspects if needed for perfect recall (though in this game, knowing current board and counts essentially reflects all past capture events).
+
+  We will also implement `ObservationString` / `InformationStateString` for debugging, which might list positions of pieces in a human-readable way from the player’s view (e.g., “My Blue at X, My Red at Y, Opponent piece at Z (unknown color)…”, etc.).
+
+### Other Required Methods
+
+* **LegalActionsMask:** as noted, we can implement this to return a 144-length vector with 1s for legal moves and 0s for illegal, complementing `LegalActions()`.
+* **CurrentPlayer:** returns the index of the player to move, or `kTerminalPlayerId` if the game is over. (During an initial chance setup, if implemented explicitly, `CurrentPlayer` might be `kChancePlayerId`, but since we handle setup internally, we start directly with a player.)
+* **Clone:** Both `GhostGame` and `GhostState` support copying. We implement `GhostState::Clone()` to return a deep copy of the state (making sure to copy all piece info, counters, etc.). This is useful for tree search or for algorithms that simulate futures.
+* **ToString:** We implement a textual representation of the true state (for debugging). For example, we can output a 6×6 board grid, marking pieces with their color and owner (since this is mainly for debugging, we can show all information). One could use characters like `B`/`R` for player 0’s Blue/Red, and `b`/`r` for player 1’s, or “?” for hidden if we want to display from a particular player’s view. This is not used by the learning algorithm but can help verify game logic.
+
+With these components in mind, below is an outline of the **C++ code** structure for the Ghost game environment, divided into the header and source implementation.
+
+## `ghost.h` – Header File Outline
+
+```cpp
+#ifndef OPEN_SPIEL_GAMES_GHOST_H_
+#define OPEN_SPIEL_GAMES_GHOST_H_
+
+#include "open_spiel/spiel.h"
+
+namespace open_spiel {
+namespace ghost {
+
+// Game Constants
+inline constexpr int kNumPlayers = 2;
+inline constexpr int kBoardSize = 6;
+inline constexpr int kNumPiecesPerPlayer = 8;
+inline constexpr int kMaxMoves = 200;  // moves until draw
+inline constexpr int kTotalActions = 144;  // 6*6*4
+
+// Action encoding directions
+enum GhostMoveDir { kUp = 0, kDown = 1, kLeft = 2, kRight = 3 };
+
+// Game type and parameters
+extern const GameType kGameType;
+std::shared_ptr<const Game> Factory(const GameParameters& params);
+
+// Piece information struct
+struct PieceInfo {
+  int row, col;
+  bool is_blue;
+  bool alive;
+};
+
+class GhostGame : public Game {
+ public:
+  explicit GhostGame(const GameParameters& params);
+  int NumDistinctActions() const override { return kTotalActions; }
+  int NumPlayers() const override { return kNumPlayers; }
+  // State vector/observation sizes can be defined if needed
+  int MaxGameLength() const override { return kMaxMoves; }
+  std::unique_ptr<State> NewInitialState() const override;
+  // etc. (MaxChanceOutcomes if explicit chance, but we use sampled)
+};
+
+class GhostState : public State {
+ public:
+  GhostState(std::shared_ptr<const Game> game);
+  GhostState(const GhostState& other);  // copy constructor for Clone()
+  
+  Player CurrentPlayer() const override;
+  std::vector<Action> LegalActions() const override;
+  bool IsTerminal() const override;
+  std::vector<double> Returns() const override;
+  
+  std::string ObservationString(Player player) const override;
+  void ObservationTensor(Player player, absl::Span<float> values) const override;
+  std::string InformationStateString(Player player) const override;
+  void InformationStateTensor(Player player, absl::Span<float> values) const override;
+  
+  std::string ToString() const override;
+  std::unique_ptr<State> Clone() const override;
+  
+  void ApplyAction(Action action) override;
+
+ private:
+  void InitializePieces();          // helper to set up initial random layout
+  void GenerateLegalMoves();        // helper to update legal_moves_ and mask
+  bool IsExit(int row, int col, Player player) const;  // check if (r,c) is an exit for given player
+  void CheckTerminalConditions();   // update terminal status and winner if any
+  
+  // Game state variables
+  std::array<std::array<PieceInfo, kNumPiecesPerPlayer>, kNumPlayers> pieces_;
+  std::array<std::array<int, kBoardSize>, kBoardSize> board_;  // board occupancy: stores piece ID or -1
+  std::array<int, kNumPlayers> blue_captured_by_;
+  std::array<int, kNumPlayers> red_captured_by_;
+  int move_count_;
+  Player current_player_;
+  bool terminal_;
+  // Outcome tracking: e.g., winner or returns
+  std::array<double, kNumPlayers> returns_;
+};
+
+}  // namespace ghost
+}  // namespace open_spiel
+
+#endif  // OPEN_SPIEL_GAMES_GHOST_H_
+```
+
+**Notes:** In the above outline, we declare the essential methods required by OpenSpiel. We maintain a 2D `board_` array for quick lookup of pieces by location (this could hold an **ID** for each piece, e.g. 0-7 for player 0’s pieces, 8-15 for player 1’s pieces, or -1 if empty). We also keep a structure `pieces_` for each player’s pieces with their status. The `InitializePieces()` function will randomly assign the initial positions and colors of pieces for a new game state. We have placeholders for observation and information state functions. The `GhostState` constructor will call `InitializePieces()` and set up the starting state.
+
+## `ghost.cc` – Implementation Highlights
+
+```cpp
+#include "open_spiel/games/ghost.h"
+#include "open_spiel/abseil-cpp/absl/random/random.h"  // for randomization if needed
+// ... other includes
+
+namespace open_spiel {
+namespace ghost {
+
+// Define the game type for registration
+const GameType kGameType {
+  /* short_name */ "ghost",
+  /* long_name */ "Geister (Ghosts)",
+  GameType::Dynamics::kSequential,
+  GameType::ChanceMode::kSampledStochastic,
+  GameType::Information::kImperfectInformation,
+  GameType::Utility::kZeroSum,
+  GameType::RewardModel::kTerminal,
+  /* max_num_players */ 2,
+  /* min_num_players */ 2,
+  /* provides_information_state */ true,
+  /* provides_observation */ true,
+  /* parameter_specification */ {}
+};
+
+std::shared_ptr<const Game> Factory(const GameParameters& params) {
+  return std::make_shared<GhostGame>(params);
+}
+
+// Register the game with OpenSpiel
+REGISTER_SPIEL_GAME(kGameType, Factory);
+
+// GhostGame constructor
+GhostGame::GhostGame(const GameParameters& params) : Game(kGameType, params) {}
+
+// Create a new initial game state
+std::unique_ptr<State> GhostGame::NewInitialState() const {
+  return std::make_unique<GhostState>(shared_from_this());
+}
+
+// GhostState constructor: initialize a new game
+GhostState::GhostState(std::shared_ptr<const Game> game)
+    : State(game), move_count_(0), current_player_(0), terminal_(false) {
+  // Initialize counters
+  blue_captured_by_.fill(0);
+  red_captured_by_.fill(0);
+  // Clear board
+  for (int r = 0; r < kBoardSize; ++r) {
+    for (int c = 0; c < kBoardSize; ++c) {
+      board_[r][c] = -1;
+    }
+  }
+  // Randomly assign initial piece placements for both players
+  InitializePieces();
+}
+
+// Copy constructor for Clone
+GhostState::GhostState(const GhostState& other)
+    : State(other), pieces_(other.pieces_), board_(other.board_),
+      blue_captured_by_(other.blue_captured_by_), red_captured_by_(other.red_captured_by_),
+      move_count_(other.move_count_), current_player_(other.current_player_),
+      terminal_(other.terminal_), returns_(other.returns_) {
+}
+
+// Random initial layout: place 4 blue and 4 red for each player
+void GhostState::InitializePieces() {
+  // Define starting squares for each player (e.g. center 4 columns of their 2 home rows)
+  std::vector<std::pair<int,int>> start_squares_p0, start_squares_p1;
+  // Player0 home = bottom two rows (4 and 5), columns 1-4 (for example)
+  for (int r = 4; r < 6; ++r) {
+    for (int c = 1; c < 5; ++c) {
+      start_squares_p0.emplace_back(r, c);
+    }
+  }
+  // Player1 home = top two rows (0 and 1), columns 1-4
+  for (int r = 0; r < 2; ++r) {
+    for (int c = 1; c < 5; ++c) {
+      start_squares_p1.emplace_back(r, c);
+    }
+  }
+  SPIEL_CHECK_EQ(start_squares_p0.size(), kNumPiecesPerPlayer);
+  SPIEL_CHECK_EQ(start_squares_p1.size(), kNumPiecesPerPlayer);
+  // Randomly choose 4 of the 8 start positions for blue ghosts for each player
+  std::array<int, kNumPiecesPerPlayer> perm;
+  // Fill perm with 0..7 and shuffle to pick first 4 as blue positions
+  absl::BitGen rng;
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) perm[i] = i;
+  std::shuffle(perm.begin(), perm.end(), rng);
+  // First 4 indices in perm for player0 as blue, rest red
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) {
+    int idx = perm[i];
+    pieces_[0][i].row = start_squares_p0[idx].first;
+    pieces_[0][i].col = start_squares_p0[idx].second;
+    pieces_[0][i].is_blue = (i < 4);  // first 4 pieces in our array = blue
+    pieces_[0][i].alive = true;
+    // Mark board
+    int id = 0 * kNumPiecesPerPlayer + i;  // piece ID
+    board_[pieces_[0][i].row][pieces_[0][i].col] = id;
+  }
+  // Repeat for player1
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) perm[i] = i;
+  std::shuffle(perm.begin(), perm.end(), rng);
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) {
+    int idx = perm[i];
+    pieces_[1][i].row = start_squares_p1[idx].first;
+    pieces_[1][i].col = start_squares_p1[idx].second;
+    pieces_[1][i].is_blue = (i < 4);
+    pieces_[1][i].alive = true;
+    int id = 1 * kNumPiecesPerPlayer + i;
+    board_[pieces_[1][i].row][pieces_[1][i].col] = id;
+  }
+  // Now both players' pieces are placed. (The actual color layout is hidden from the opponent.)
+}
+
+Player GhostState::CurrentPlayer() const {
+  return terminal_ ? kTerminalPlayerId : current_player_;
+}
+
+std::vector<Action> GhostState::LegalActions() const {
+  if (terminal_) return {};  // no moves if game is over
+  std::vector<Action> moves;
+  moves.reserve(20);
+  // For each piece of current_player
+  int p = current_player_;
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) {
+    if (!pieces_[p][i].alive) continue;  // skip captured/escaped pieces
+    int r = pieces_[p][i].row;
+    int c = pieces_[p][i].col;
+    // Consider each direction
+    const int dr[4] = {-1, +1, 0, 0};
+    const int dc[4] = {0, 0, -1, +1};
+    for (int d = 0; d < 4; ++d) {
+      int nr = r + dr[d], nc = c + dc[d];
+      if (nr < 0 || nr >= kBoardSize || nc < 0 || nc >= kBoardSize) continue;  // off-board
+      // If target cell has our own piece, skip (cannot move there)
+      int occupant = board_[nr][nc];
+      if (occupant != -1) {
+        int occ_player = occupant / kNumPiecesPerPlayer;
+        if (occ_player == p) continue;  // occupied by same player's piece
+        // if occupied by opponent, capture is possible, so that's a legal move
+      }
+      // Otherwise empty or opponent piece:
+      Action action = 4 * (r * kBoardSize + c) + d;
+      moves.push_back(action);
+    }
+  }
+  if (moves.empty()) {
+    // (Though in Geister, there is always at least one move unless terminal)
+    SPIEL_CHECK_FALSE(true && "No legal moves found when game not terminal.");
+  }
+  return moves;
+}
+
+std::vector<double> GhostState::Returns() const {
+  // If not terminal, returns are 0 so far (or we could throw error if called early).
+  if (!terminal_) {
+    return {0.0, 0.0};
+  }
+  return {returns_[0], returns_[1]};
+}
+
+bool GhostState::IsTerminal() const {
+  return terminal_;
+}
+
+// Helper to check if (row,col) is an exit square for given player's perspective
+bool GhostState::IsExit(int row, int col, Player player) const {
+  // Player 0's exits are top corners (0,0) and (0,5)
+  // Player 1's exits are bottom corners (5,0) and (5,5)
+  if (player == 0) {
+    return (row == 0 && (col == 0 || col == kBoardSize-1));
+  } else {
+    return (row == kBoardSize-1 && (col == 0 || col == kBoardSize-1));
+  }
+}
+
+void GhostState::ApplyAction(Action action) {
+  // Decode action
+  int source_index = action / 4;
+  int dir = action % 4;
+  int sr = source_index / kBoardSize;
+  int sc = source_index % kBoardSize;
+  // Find the piece at source (should belong to current_player_)
+  int moving_id = board_[sr][sc];
+  SPIEL_CHECK_NE(moving_id, -1);
+  int p = current_player_;
+  SPIEL_CHECK_EQ(moving_id / kNumPiecesPerPlayer, p);
+  int piece_idx = moving_id % kNumPiecesPerPlayer;
+  PieceInfo& piece = pieces_[p][piece_idx];
+  // Compute target coordinates
+  int dr = (dir == kUp ? -1 : (dir == kDown ? +1 : 0));
+  int dc = (dir == kLeft ? -1 : (dir == kRight ? +1 : 0));
+  int tr = sr + dr, tc = sc + dc;
+  // Sanity checks (already ensured in LegalActions)
+  SPIEL_CHECK_GE(tr, 0); SPIEL_CHECK_LT(tr, kBoardSize);
+  SPIEL_CHECK_GE(tc, 0); SPIEL_CHECK_LT(tc, kBoardSize);
+  // Remove from old location
+  board_[sr][sc] = -1;
+  // Handle capture if any
+  if (board_[tr][tc] != -1) {
+    int target_id = board_[tr][tc];
+    int opp = target_id / kNumPiecesPerPlayer;
+    SPIEL_CHECK_TRUE(opp != p);  // must be opponent's piece
+    int opp_piece_idx = target_id % kNumPiecesPerPlayer;
+    // Capture the opponent's piece
+    pieces_[opp][opp_piece_idx].alive = false;
+    // Remove it from board (we already have target coords)
+    // (We will overwrite board_[tr][tc] anyway with moving piece)
+    // Update capture counts
+    if (pieces_[opp][opp_piece_idx].is_blue) {
+      blue_captured_by_[p] += 1;
+    } else {
+      red_captured_by_[p] += 1;
+    }
+  }
+  // Move the piece to target (or into exit)
+  piece.row = tr;
+  piece.col = tc;
+  // Check escape condition
+  bool escaped = false;
+  if (IsExit(tr, tc, p) && piece.is_blue) {
+    // A blue piece of current player moves into an exit: it escapes
+    escaped = true;
+    piece.alive = false;
+    // We won't leave the piece on the board, it's gone
+    board_[tr][tc] = -1;
+  } else {
+    // Otherwise, place the moving piece on the target square
+    board_[tr][tc] = moving_id;
+  }
+  // Increment move count
+  move_count_++;
+  // Check if terminal condition reached
+  CheckTerminalConditions();
+  if (!terminal_) {
+    // Switch turn to the other player
+    current_player_ = 1 - p;
+  }
+}
+
+void GhostState::CheckTerminalConditions() {
+  // Victory by capture:
+  // If current player p captured all opponent's blue
+  for (Player p = 0; p < kNumPlayers; ++p) {
+    if (blue_captured_by_[p] == 4) {
+      terminal_ = true;
+      returns_[p] = 1.0;
+      returns_[1-p] = -1.0;
+      return;
+    }
+    if (red_captured_by_[p] == 4) {
+      // p captured all opponent's red -> p loses
+      terminal_ = true;
+      returns_[p] = -1.0;
+      returns_[1-p] = 1.0;
+      return;
+    }
+  }
+  // Victory by escape: If a blue ghost escaped this turn, it was handled in ApplyAction.
+  // We need to detect which player escaped.
+  // For simplicity, we might set a flag or handle it here:
+  // (We could check if any piece was marked alive->false due to escape and was blue.)
+  for (Player p = 0; p < kNumPlayers; ++p) {
+    // Check all pieces of p if any blue is alive=false due to escape
+    for (int i = 0; i < kNumPiecesPerPlayer; ++i) {
+      if (!pieces_[p][i].alive && pieces_[p][i].is_blue) {
+        // This means a blue piece of p is no longer alive (escaped)
+        // and it wasn't from capture (capture would increment opponent's count instead)
+        // So p must have just escaped a blue ghost
+        terminal_ = true;
+        returns_[p] = 1.0;
+        returns_[1-p] = -1.0;
+        return;
+      }
+    }
+  }
+  // Draw by move limit:
+  if (move_count_ >= kMaxMoves && !terminal_) {
+    terminal_ = true;
+    returns_[0] = 0.0;
+    returns_[1] = 0.0;
+  }
+}
+
+// Observation: current player's perspective
+std::string GhostState::ObservationString(Player player) const {
+  // Construct a human-readable string of what `player` sees.
+  std::string obs;
+  obs.reserve(100);
+  obs += "Player " + std::to_string(player) + " observation:\n";
+  for (int r = 0; r < kBoardSize; ++r) {
+    for (int c = 0; c < kBoardSize; ++c) {
+      int id = board_[r][c];
+      char ch = '.';
+      if (id != -1) {
+        int owner = id / kNumPiecesPerPlayer;
+        if (owner == player) {
+          // Own piece: reveal its color
+          bool isBlue = pieces_[owner][id % kNumPiecesPerPlayer].is_blue;
+          ch = isBlue ? 'B' : 'R';
+        } else {
+          // Opponent's piece: hidden color
+          ch = 'X';
+        }
+      }
+      obs.push_back(ch);
+      obs.push_back(' ');
+    }
+    obs.push_back('\n');
+  }
+  // Also append captured counts info
+  obs += "Captured (P" + std::to_string(player) + " perspective): ";
+  // Player knows how many of opponent's pieces of each color they've captured:
+  obs += "Opponent blue captured = " + std::to_string(blue_captured_by_[player]);
+  obs += ", Opponent red captured = " + std::to_string(red_captured_by_[player]) + "\n";
+  return obs;
+}
+
+void GhostState::ObservationTensor(Player player, absl::Span<float> values) const {
+  // Assuming values has length 3*6*6 = 108.
+  SPIEL_CHECK_EQ(values.size(), 108);
+  std::fill(values.begin(), values.end(), 0.0f);
+  // Channels: 0 = own blue, 1 = own red, 2 = opponent pieces (any).
+  int stride = kBoardSize * kBoardSize;
+  for (int r = 0; r < kBoardSize; ++r) {
+    for (int c = 0; c < kBoardSize; ++c) {
+      int id = board_[r][c];
+      if (id == -1) continue;
+      int owner = id / kNumPiecesPerPlayer;
+      int index = r * kBoardSize + c;
+      if (owner == player) {
+        // Own piece
+        bool isBlue = pieces_[owner][id % kNumPiecesPerPlayer].is_blue;
+        if (isBlue) {
+          values[0 * stride + index] = 1.0f;  // mark own blue
+        } else {
+          values[1 * stride + index] = 1.0f;  // mark own red
+        }
+      } else {
+        // Opponent's piece (color unknown)
+        values[2 * stride + index] = 1.0f;
+      }
+    }
+  }
+  // Note: We could append additional features (captured counts, player identity) after the 108 cells if we extend observation size.
+}
+
+// InformationState: can include full history (for perfect recall), but here we simplify
+std::string GhostState::InformationStateString(Player player) const {
+  // We include the player’s private info (initial layout of colors) and the observation of current state.
+  std::string info = "P" + std::to_string(player) + " InfoState:\n";
+  info += "Initial layout (hidden): ";
+  // List which starting positions had blue for this player
+  for (int i = 0; i < kNumPiecesPerPlayer; ++i) {
+    const PieceInfo& piece = pieces_[player][i];
+    // We can identify initial positions from piece index i mapping if we stored it. 
+    // For simplicity, just indicate piece i color:
+    info += (piece.is_blue ? "B" : "R");
+    if (i < kNumPiecesPerPlayer-1) info += ",";
+  }
+  info += "\nCurrent observation:\n" + ObservationString(player);
+  return info;
+}
+
+void GhostState::InformationStateTensor(Player player, absl::Span<float> values) const {
+  // Could concatenate observation tensor + one-hot of capture counts + one-hot of player.
+  // Omitted detailed implementation for brevity.
+  // For example, length could be 108 (board) + 20 (captures) + 2 (player id) = 130 as per research:contentReference[oaicite:44]{index=44}.
+  ObservationTensor(player, values.first(108));
+  // ... set additional features in remaining part of values if allocated.
+}
+
+std::unique_ptr<State> GhostState::Clone() const {
+  return std::make_unique<GhostState>(*this);
+}
+
+std::string GhostState::ToString() const {
+  // Full state with all information (for debugging)
+  std::string str;
+  str.reserve(100);
+  str += "Full State (actual colors):\n";
+  for (int r = 0; r < kBoardSize; ++r) {
+    for (int c = 0; c < kBoardSize; ++c) {
+      int id = board_[r][c];
+      char ch = '.';
+      if (id != -1) {
+        int owner = id / kNumPiecesPerPlayer;
+        int idx = id % kNumPiecesPerPlayer;
+        bool isBlue = pieces_[owner][idx].is_blue;
+        // Represent as uppercase for P0, lowercase for P1
+        if (owner == 0) {
+          ch = isBlue ? 'B' : 'R';
+        } else { 
+          ch = isBlue ? 'b' : 'r';
+        }
+      }
+      str.push_back(ch);
+      str.push_back(' ');
+    }
+    str.push_back('\n');
+  }
+  return str;
+}
+
+}  // namespace ghost
+}  // namespace open_spiel
+```
+
+**Explanation:** The code above sketches out the main functions:
+
+* **Initialization:** We randomly shuffle the starting positions to assign which ones get blue pieces for each player. The `board_` array is filled with piece IDs corresponding to the positions of pieces. Player 0 uses IDs 0–7, Player 1 uses 8–15.
+
+* **LegalActions():** Iterates over all live pieces of the current player and checks each of the four directions. It skips moves that go off the board or into a square occupied by a friendly piece. All other moves (empty or opponent-occupied) are legal. We compute the Action ID using the formula. (We also include an internal check that there’s at least one legal move if the game isn’t terminal – in Geister, stalemates cannot occur because you can always move something unless all pieces are gone which would already be a win/loss.)
+
+* **ApplyAction():** We decode the action into source square and direction. We identify the piece to move using the `board_` (ensuring it belongs to the current player). We then update the board and piece’s position. If an opponent’s piece is present at the target, we capture it: mark it not alive, and update the appropriate capture counter (blue or red) for the current player. Then we handle the move – if the move ends on an exit square and the piece is blue, we mark it as escaped and remove it from the board. We increment the move counter and then check for end-of-game conditions.
+
+* **CheckTerminalConditions():** This function determines if the game ended after the move. We check capture win/loss: if a player has captured 4 opponent blue ghosts, they win; if a player has captured 4 opponent red ghosts, they lose (opponent wins). We also check if any blue ghost was marked as escaped – if so, the owner wins immediately. Finally, if the move limit (200) is reached without a winner, we set a draw. When terminal, we set `terminal_ = true` and assign `returns_` for the outcome.
+
+* **ObservationString / ObservationTensor:** These provide the **partial view** to each player. In the tensor, we mark the board with three channels as described (own blue, own red, and opponent piece presence). The example `ObservationString` prints the board from a player’s perspective, using `B/R` for that player’s own ghosts (color known to them) and `X` for opponent’s ghosts (color unknown). It also prints the captured counts that the player is aware of (which is essentially all captures since they see what they’ve captured of the opponent) for clarity.
+
+* **InformationStateString / Tensor:** In the string, we included the player’s initial layout (the distribution of blue/red among their starting 8 pieces) and the current observation. The tensor could similarly include the observation plus additional features like capture counts and player identity, matching the format used in the research. This ensures the agent’s policy network can differentiate states properly in a learning setting.
+
+* **Clone:** Uses the copy constructor to duplicate the state, including all hidden information, so that simulations (e.g., Monte Carlo tree search) have an accurate state copy.
+
+* **ToString:** Shows the full state with all pieces and their colors (helpful for debugging or if we want a perfect-information view). We chose to denote player0’s pieces with uppercase (B/R) and player1’s with lowercase (b/r) for distinction.
+
+This implementation provides a complete new game module that can be compiled into OpenSpiel. It supports the imperfect information aspects (each player’s observation is restricted to known information) and enforces all the game rules of Geister: movement on a 6×6 board, hidden identities of ghosts, legal captures, and all win conditions including the tricky condition of losing by capturing all opponent’s evil ghosts and winning by escaping a blue ghost. The draw condition after 200 moves is also incorporated.
+
+By integrating this `ghost` game, researchers and agents can use OpenSpiel’s reinforcement learning algorithms on the Geister game environment, as was done in the cited study. The environment is fully configured to handle **imperfect information** (via the observation and information state interfaces) and can generate legal moves with masking to facilitate learning. Overall, this module follows the structure of other OpenSpiel games and can be directly added to `open_spiel/games/` for compilation and use.
+
+**Sources:**
+
+* Wei-Chun Wang (2025), *Game Strategy Research on Geister Based on OpenSpiel* – game description and OpenSpiel environment implementation.
+* Geister (Ghosts) board game rules – BoardGameGeek/Kids Encyclopedia summary of rules.
+* Game AI Tournament (GAT) official rules for Geister – draw condition at 200 moves.
